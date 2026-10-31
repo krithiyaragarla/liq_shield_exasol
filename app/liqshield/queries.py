@@ -1,0 +1,135 @@
+"""All analytics SQL. One dialect-neutral text, executed unchanged on Exasol and DuckDB.
+
+Scenario parameters are cast to float/int in Python before formatting, so no user text ever reaches SQL.
+
+Scenario knobs
+  haircut_shock  : additive haircut increase (0.10 = +10 percentage points on every asset class)
+  delay_days     : incoming cash arrives this many days late
+  margin_mult    : multiplier on margin calls (1.20 = +20%)
+"""
+
+LADDER_CTES = """
+WITH elig AS (
+    SELECT c.ASSET_ID, c.ASSET_TYPE, c.AMOUNT, c.SETTLEMENT_LAG_DAYS,
+           LEAST(1.0, h.HAIRCUT_PCT + {haircut_shock}) AS HC,
+           c.AMOUNT * (1 - LEAST(1.0, h.HAIRCUT_PCT + {haircut_shock})) AS ELIGIBLE_VALUE
+    FROM COLLATERAL_INVENTORY c
+    JOIN HAIRCUT_RULES h ON c.ASSET_TYPE = h.ASSET_TYPE
+    WHERE c.ENCUMBERED_FLAG = FALSE
+),
+cf AS (
+    SELECT CASE WHEN DIRECTION = 'In' THEN VALUE_DAY + {delay_days} ELSE VALUE_DAY END AS EFF_DAY,
+           CASE WHEN DIRECTION = 'In' THEN AMOUNT
+                WHEN OBLIGATION_TYPE IN ('MARGIN_CALL', 'STRESS_MARGIN_CALL') THEN -AMOUNT * {margin_mult}
+                ELSE -AMOUNT END AS NET
+    FROM CASHFLOW_OBLIGATIONS
+),
+daily AS (
+    SELECT t.DAY_OFFSET, t.BUCKET_DATE,
+           COALESCE(SUM(CASE WHEN cf.NET > 0 THEN cf.NET END), 0) AS INFLOW,
+           COALESCE(SUM(CASE WHEN cf.NET < 0 THEN -cf.NET END), 0) AS OUTFLOW,
+           COALESCE(SUM(cf.NET), 0) AS NET_CASHFLOW
+    FROM TIME_BUCKETS t
+    LEFT JOIN cf ON cf.EFF_DAY = t.DAY_OFFSET
+    GROUP BY t.DAY_OFFSET, t.BUCKET_DATE
+),
+mob AS (
+    SELECT t.DAY_OFFSET,
+           SUM(CASE WHEN e.SETTLEMENT_LAG_DAYS <= t.DAY_OFFSET THEN e.ELIGIBLE_VALUE ELSE 0 END) AS MOBILISABLE
+    FROM TIME_BUCKETS t CROSS JOIN elig e
+    GROUP BY t.DAY_OFFSET
+),
+ladder AS (
+    SELECT d.DAY_OFFSET, d.BUCKET_DATE, d.INFLOW, d.OUTFLOW, d.NET_CASHFLOW,
+           SUM(d.NET_CASHFLOW) OVER (ORDER BY d.DAY_OFFSET) AS CUM_CASHFLOW,
+           m.MOBILISABLE,
+           m.MOBILISABLE + SUM(d.NET_CASHFLOW) OVER (ORDER BY d.DAY_OFFSET) AS LIQUIDITY_BUFFER
+    FROM daily d JOIN mob m ON d.DAY_OFFSET = m.DAY_OFFSET
+)
+"""
+
+ELIGIBLE_SQL = """
+SELECT c.ASSET_ID, c.ASSET_TYPE, c.CUSTODIAN, c.AMOUNT AS MARKET_VALUE, c.ENCUMBERED_FLAG,
+       c.SETTLEMENT_LAG_DAYS,
+       LEAST(1.0, h.HAIRCUT_PCT + {haircut_shock}) AS HAIRCUT_PCT,
+       CASE WHEN c.ENCUMBERED_FLAG THEN 0
+            ELSE c.AMOUNT * (1 - LEAST(1.0, h.HAIRCUT_PCT + {haircut_shock})) END AS ELIGIBLE_VALUE
+FROM COLLATERAL_INVENTORY c
+JOIN HAIRCUT_RULES h ON c.ASSET_TYPE = h.ASSET_TYPE
+ORDER BY c.ASSET_ID
+"""
+
+LADDER_SQL = LADDER_CTES + "SELECT * FROM ladder ORDER BY DAY_OFFSET"
+
+# Shortfall severity, time to shortfall, duration, in one pass.
+METRICS_SQL = LADDER_CTES + """
+SELECT MIN(LIQUIDITY_BUFFER)                                          AS MIN_BUFFER,
+       MIN(CASE WHEN LIQUIDITY_BUFFER < 0 THEN DAY_OFFSET END)        AS FIRST_SHORTFALL_DAY,
+       MAX(CASE WHEN LIQUIDITY_BUFFER < 0 THEN -LIQUIDITY_BUFFER ELSE 0 END) AS PEAK_SHORTFALL,
+       SUM(CASE WHEN LIQUIDITY_BUFFER < 0 THEN 1 ELSE 0 END)          AS SHORTFALL_DAYS,
+       MAX(DAY_OFFSET)                                                AS LAST_DAY
+FROM ladder
+"""
+
+# Funding waterfall: cheapest-first, only facilities that can be drawn by the first shortfall day.
+# cost = draw * (annual bps/10000) * days_outstanding/360 + draw * upfront_bps/10000
+FUNDING_SQL = """
+WITH fac AS (
+    SELECT FACILITY_ID, FACILITY_NAME, LIMIT_AMOUNT, AVAILABLE_FROM_DAY, COST_BPS, UPFRONT_FEE_BPS,
+           CASE WHEN AVAILABLE_FROM_DAY <= {first_day} THEN 1 ELSE 0 END AS IN_TIME
+    FROM FUNDING_FACILITIES
+),
+ranked AS (
+    SELECT f.*,
+           SUM(CASE WHEN IN_TIME = 1 THEN LIMIT_AMOUNT ELSE 0 END)
+               OVER (ORDER BY COST_BPS, FACILITY_ID) AS CUM_LIMIT
+    FROM fac f
+)
+SELECT FACILITY_ID, FACILITY_NAME, LIMIT_AMOUNT, AVAILABLE_FROM_DAY, COST_BPS, UPFRONT_FEE_BPS, IN_TIME,
+       CASE WHEN IN_TIME = 1
+            THEN GREATEST(0, LEAST(LIMIT_AMOUNT, {shortfall} - (CUM_LIMIT - LIMIT_AMOUNT)))
+            ELSE 0 END AS DRAW_AMOUNT,
+       CASE WHEN IN_TIME = 1
+            THEN GREATEST(0, LEAST(LIMIT_AMOUNT, {shortfall} - (CUM_LIMIT - LIMIT_AMOUNT)))
+                 * (COST_BPS / 10000.0 * {days_out} / 360.0 + UPFRONT_FEE_BPS / 10000.0)
+            ELSE 0 END AS INTERVENTION_COST
+FROM ranked
+ORDER BY COST_BPS, FACILITY_ID
+"""
+
+# Cost of covering the whole shortfall with ONE facility (for the comparison table).
+SINGLE_ACTION_SQL = """
+SELECT FACILITY_ID, FACILITY_NAME, LIMIT_AMOUNT, AVAILABLE_FROM_DAY, COST_BPS,
+       CASE WHEN AVAILABLE_FROM_DAY <= {first_day} THEN 1 ELSE 0 END AS IN_TIME,
+       CASE WHEN LIMIT_AMOUNT >= {shortfall} THEN 1 ELSE 0 END AS COVERS_ALONE,
+       LEAST(LIMIT_AMOUNT, {shortfall}) AS COVERED_AMOUNT,
+       LEAST(LIMIT_AMOUNT, {shortfall}) * (COST_BPS / 10000.0 * {days_out} / 360.0 + UPFRONT_FEE_BPS / 10000.0)
+           AS COST
+FROM FUNDING_FACILITIES
+ORDER BY COST_BPS, FACILITY_ID
+"""
+
+# Monte Carlo: Exasol runs the in-database Python UDF; local mode computes the same thing in Python.
+MC_EXASOL_SQL = """
+SELECT c.ASSET_ID, c.ASSET_TYPE, c.AMOUNT * (1 - h.HAIRCUT_PCT) AS BASE_ELIGIBLE,
+       MC_ELIGIBLE_P5(c.AMOUNT, h.HAIRCUT_PCT, {vol}, {n_paths}, {seed}) AS P5_ELIGIBLE
+FROM COLLATERAL_INVENTORY c JOIN HAIRCUT_RULES h ON c.ASSET_TYPE = h.ASSET_TYPE
+WHERE c.ENCUMBERED_FLAG = FALSE
+ORDER BY c.ASSET_ID
+"""
+MC_BASE_SQL = """
+SELECT c.ASSET_ID, c.ASSET_TYPE, c.AMOUNT, h.HAIRCUT_PCT, c.AMOUNT * (1 - h.HAIRCUT_PCT) AS BASE_ELIGIBLE
+FROM COLLATERAL_INVENTORY c JOIN HAIRCUT_RULES h ON c.ASSET_TYPE = h.ASSET_TYPE
+WHERE c.ENCUMBERED_FLAG = FALSE
+ORDER BY c.ASSET_ID
+"""
+
+EXPOSURE_SQL = """
+SELECT COUNTERPARTY,
+       SUM(CASE WHEN DIRECTION = 'Out' THEN AMOUNT ELSE 0 END) AS TOTAL_OUT,
+       SUM(CASE WHEN OBLIGATION_TYPE IN ('MARGIN_CALL', 'STRESS_MARGIN_CALL') THEN AMOUNT ELSE 0 END) AS MARGIN_CALLS,
+       SUM(CASE WHEN DIRECTION = 'In' THEN AMOUNT ELSE 0 END) AS TOTAL_IN
+FROM CASHFLOW_OBLIGATIONS
+GROUP BY COUNTERPARTY
+ORDER BY TOTAL_OUT DESC
+"""

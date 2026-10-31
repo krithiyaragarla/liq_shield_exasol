@@ -1,0 +1,7 @@
+asset_id,asset_type,amount,encumbered_flag,custodian,settlement_lag_days
+AST-001,Cash,5000000,False,Treasury Vault,0
+AST-002,US_Treasury,10000000,False,Custodian A,1
+AST-003,Corp_Bond_AAA,8000000,True,Custodian A,1
+AST-004,Corp_Bond_BBB,2000000,False,Custodian B,1
+AST-005,Equities,3000000,False,Custodian B,2
+AST-006,Corp_Bond_AAA,4000000,False,Custodian A,1

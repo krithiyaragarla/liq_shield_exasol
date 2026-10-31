@@ -1,0 +1,5 @@
+trade_id,asset_class,counterparty,notional,maturity_date
+TRD-101,FX_Swap,Bank_A,50000000,2027-05-01
+TRD-102,Interest_Rate_Swap,Bank_B,100000000,2028-10-22
+TRD-103,Options,Bank_C,25000000,2027-01-31
+TRD-104,FX_Forward,Bank_A,30000000,2026-12-02

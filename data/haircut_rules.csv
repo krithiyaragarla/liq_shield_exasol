@@ -1,0 +1,6 @@
+asset_type,rating,haircut_pct
+Cash,NA,0.0
+US_Treasury,AAA,0.02
+Corp_Bond_AAA,AAA,0.05
+Corp_Bond_BBB,BBB,0.15
+Equities,NA,0.25
