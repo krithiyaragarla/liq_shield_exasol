@@ -12,7 +12,7 @@ settlement delays across an 8-day time ladder, compares funding actions subject 
 shortfall severity, time to shortfall and intervention cost.
 
 **How Exasol is used:**
-Every calculation runs in Exasol SQL — joins, eligibility filters, time-bucket aggregation, window-function
+Every calculation runs in Exasol SQL joins, eligibility filters, time-bucket aggregation, window-function
 cumulative ladders, a funding waterfall using window sums — plus an in-database Python UDF for Monte Carlo haircut
 shocks. Each dashboard slider issues a parameterised query to Exasol Personal.
 
